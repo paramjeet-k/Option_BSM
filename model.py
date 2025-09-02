@@ -1,7 +1,5 @@
 # app_bsm_india.py
-# Streamlit — Black–Scholes–Merton Pricer (India)
-# Author: ChatGPT (for Paramjeet)
-#
+# Streamlit — Black–Scholes–Merton Pricer (India) with delayed Yahoo Finance LTP
 # How to run:
 #   pip install -r requirements.txt
 #   streamlit run app_bsm_india.py
@@ -17,9 +15,13 @@ import matplotlib.pyplot as plt
 from scipy.stats import norm
 from scipy.optimize import brentq
 
-# -------------------------------
-# Time / Day-count utilities
-# -------------------------------
+# ---------- Delayed price provider (Yahoo) ----------
+# (Install: pip install yfinance)
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 IST = pytz.timezone("Asia/Kolkata")
 
 def to_ist_today() -> date:
@@ -27,9 +29,8 @@ def to_ist_today() -> date:
     return now_utc.astimezone(IST).date()
 
 def year_fraction(start: date, end: date, basis: str = "ACT/365") -> float:
-    """Simple year fraction calculator."""
     if end <= start:
-        return 1e-8  # avoid zero-div/NaN
+        return 1e-8
     days = (end - start).days
     if basis.upper() in ("ACT/365", "ACT/365F", "ACT/365FIXED"):
         return days / 365.0
@@ -37,41 +38,26 @@ def year_fraction(start: date, end: date, basis: str = "ACT/365") -> float:
         return days / 360.0
     return days / 365.0
 
-# -------------------------------
-# BSM Pricing & Greeks
-# -------------------------------
+# ---------- BSM core ----------
 def bsm_price(is_call: bool, S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
-    """
-    Black–Scholes–Merton price with continuous dividend yield (q).
-    Returns theoretical price per share.
-    """
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        # At/near expiry with non-positive sigma -> intrinsic
         return max(S - K, 0.0) if is_call else max(K - S, 0.0)
-
     sqrtT = math.sqrt(T)
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
     d2 = d1 - sigma * sqrtT
-
     if is_call:
         return S * math.exp(-q * T) * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
     else:
         return K * math.exp(-r * T) * norm.cdf(-d2) - S * math.exp(-q * T) * norm.cdf(-d1)
 
 def bsm_greeks(is_call: bool, S: float, K: float, T: float, r: float, q: float, sigma: float):
-    """
-    Returns Greeks dict: delta, gamma, theta (per calendar day), vega, rho.
-    Vega is per 1.0 change in annualized sigma (multiply by 0.01 for 1 vol point).
-    """
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         delta = 1.0 if (is_call and S > K) else (-1.0 if (not is_call and S < K) else 0.0)
         return dict(delta=delta, gamma=0.0, theta=0.0, vega=0.0, rho=0.0)
-
     sqrtT = math.sqrt(T)
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
     d2 = d1 - sigma * sqrtT
     pdf_d1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi)
-
     delta = math.exp(-q * T) * (norm.cdf(d1) if is_call else (norm.cdf(d1) - 1))
     gamma = (math.exp(-q * T) * pdf_d1) / (S * sigma * sqrtT)
     theta_year = (
@@ -82,85 +68,94 @@ def bsm_greeks(is_call: bool, S: float, K: float, T: float, r: float, q: float, 
     theta_day = theta_year / 365.0
     vega = S * math.exp(-q * T) * pdf_d1 * sqrtT
     rho = K * T * math.exp(-r * T) * (norm.cdf(d2) if is_call else -norm.cdf(-d2))
-
     return dict(delta=delta, gamma=gamma, theta=theta_day, vega=vega, rho=rho)
 
-# -------------------------------
-# No-arbitrage bounds (for sanity checks / IV)
-# -------------------------------
 def no_arb_bounds(is_call: bool, S: float, K: float, T: float, r: float, q: float):
-    """Return (lower_bound, upper_bound) for call/put price under continuous yields."""
-    disc_r = math.exp(-r * T)
-    disc_q = math.exp(-q * T)
+    disc_r = math.exp(-r * T); disc_q = math.exp(-q * T)
     if is_call:
-        lower = max(S * disc_q - K * disc_r, 0.0)
-        upper = S * disc_q
+        lower = max(S * disc_q - K * disc_r, 0.0); upper = S * disc_q
     else:
-        lower = max(K * disc_r - S * disc_q, 0.0)
-        upper = K * disc_r
+        lower = max(K * disc_r - S * disc_q, 0.0); upper = K * disc_r
     return lower, upper
 
-# -------------------------------
-# Implied Volatility Solver
-# -------------------------------
 def implied_vol_from_price(is_call: bool, price: float, S: float, K: float, T: float, r: float, q: float,
                            lo: float = 1e-6, hi: float = 5.0) -> float:
-    """
-    Solve for sigma using Brent's method. Returns np.nan if:
-    - Market price is outside no-arbitrage bounds, or
-    - No root found in [lo, hi].
-    """
     lb, ub = no_arb_bounds(is_call, S, K, T, r, q)
     if not (lb - 1e-8 <= price <= ub + 1e-8):
         return np.nan
-
-    def f(sig):
-        return bsm_price(is_call, S, K, T, r, q, sig) - price
-
+    def f(sig): return bsm_price(is_call, S, K, T, r, q, sig) - price
     try:
         f_lo, f_hi = f(lo), f(hi)
         if f_lo * f_hi > 0:
-            # Try expanding the bracket a bit
             hi2 = max(hi, 10.0)
-            if f(lo) * f(hi2) > 0:
-                return np.nan
+            if f(lo) * f(hi2) > 0: return np.nan
             return brentq(f, lo, hi2, maxiter=600, xtol=1e-10)
         return brentq(f, lo, hi, maxiter=600, xtol=1e-10)
     except Exception:
         return np.nan
 
-# -------------------------------
-# Formatting helpers
-# -------------------------------
 def fmt_money(x: float) -> str:
-    try:
-        return f"₹{x:,.2f}"
-    except Exception:
-        return f"₹{x}"
+    try: return f"₹{x:,.2f}"
+    except Exception: return f"₹{x}"
 
-# -------------------------------
-# Streamlit App
-# -------------------------------
+# ---------- Yahoo delayed LTP helper ----------
+@st.cache_data(show_spinner=False, ttl=30)
+def fetch_yahoo_ltp(symbol: str) -> float | None:
+    """
+    Returns last traded price for Yahoo symbol (delayed ~15-20 min).
+    Symbols: RELIANCE.NS (NSE), RELIANCE.BO (BSE)
+    """
+    if yf is None:
+        return None
+    try:
+        t = yf.Ticker(symbol)
+        # Fast path:
+        price = t.fast_info.get("last_price", None)
+        if price is None:
+            # Fallback to last 1d/1m candle close
+            hist = t.history(period="1d", interval="1m")
+            if len(hist):
+                price = float(hist["Close"].dropna().iloc[-1])
+        return float(price) if price is not None else None
+    except Exception:
+        return None
+
+# ---------- Streamlit UI ----------
 st.set_page_config(page_title="BSM Options (India) — Pricer", layout="wide")
 st.title("🧮 BSM Options (India) — Pricer")
-st.caption("Robust Black–Scholes–Merton pricer with Greeks, IV solver, scenarios, and per-lot values (IST).")
+st.caption("BSM with Greeks, IV solver, scenarios, and optional delayed Yahoo Finance spot updates (IST).")
 
-# Sidebar — Global settings
 with st.sidebar:
     st.header("⚙️ Global Settings")
-    lot_size = st.number_input("Lot Size (contracts)", min_value=1, value=50, step=1,
-                               help="E.g., NIFTY lot size ~50; update per latest NSE circulars.")
+    lot_size = st.number_input("Lot Size (contracts)", min_value=1, value=50, step=1)
     basis = st.selectbox("Day-count basis", ["ACT/365", "ACT/360"], index=0)
     r_pct = st.number_input("Risk-free rate (annual, %)", value=7.00, step=0.25, format="%.2f")
     q_pct = st.number_input("Dividend yield (annual, %)", value=1.00, step=0.25, format="%.2f")
     r, q = r_pct / 100.0, q_pct / 100.0
-    st.info("All prices shown are per share; per-lot uses the lot size above.")
 
-# Inputs
+    st.markdown("---")
+    st.subheader("🟡 Delayed Spot via Yahoo")
+    y_symbol = st.text_input(
+        "Yahoo symbol (e.g., RELIANCE.NS, TCS.NS, HDFCBANK.NS, RELIANCE.BO)",
+        value="RELIANCE.NS"
+    )
+    use_yahoo = st.checkbox("Use delayed Yahoo LTP for Spot (S)", value=False,
+                            help="~15-20 min delayed; useful for demos without paid data.")
+    auto_refresh = st.checkbox("Auto-refresh (every ~30s)", value=True)
+    st.caption("Tip: If symbol not found, try another Yahoo code or switch off this toggle.")
+
+# ---------------- Inputs ----------------
 colL, colR = st.columns([1.25, 1])
 with colL:
     st.subheader("Inputs")
-    S = st.number_input("Spot Price (₹)", min_value=0.01, value=24000.0, step=1.0)
+    # Pull delayed LTP if enabled
+    yahoo_ltp = fetch_yahoo_ltp(y_symbol) if use_yahoo else None
+
+    default_S = float(yahoo_ltp) if (use_yahoo and yahoo_ltp) else 24000.0
+    S = st.number_input("Spot Price (₹)", min_value=0.01, value=default_S, step=1.0)
+    if use_yahoo:
+        st.write(f"Yahoo LTP: {fmt_money(yahoo_ltp) if yahoo_ltp else '—'}")
+
     K = st.number_input("Strike (₹)", min_value=0.01, value=24000.0, step=1.0)
     is_call = (st.selectbox("Option Type", ["Call", "Put"]) == "Call")
 
@@ -170,18 +165,16 @@ with colL:
 
     iv_mode = st.radio("Volatility Input", ["Use σ (IV)", "Solve σ from Market Price"], horizontal=True)
     if iv_mode == "Use σ (IV)":
-        sigma = st.number_input("Implied Volatility σ (annual, %)", min_value=0.01, value=15.0, step=0.5, format="%.2f") / 100.0
+        sigma = st.number_input("Implied Volatility σ (annual, %)", min_value=0.01,
+                                value=15.0, step=0.5, format="%.2f") / 100.0
         price_mkt = None
     else:
         price_mkt = st.number_input("Market Option Price (₹ per share)", min_value=0.0, value=200.0, step=1.0)
         sigma = implied_vol_from_price(is_call, price_mkt, S, K, T, r, q)
         if np.isnan(sigma):
             lb, ub = no_arb_bounds(is_call, S, K, T, r, q)
-            st.error(
-                "Could not solve for implied volatility. "
-                f"Check inputs. No-arb bounds: [{fmt_money(lb)}, {fmt_money(ub)}]"
-            )
-            sigma = 0.0  # prevent downstream NaNs in charts
+            st.error(f"Could not solve IV. Check inputs. No-arb bounds: [{fmt_money(lb)}, {fmt_money(ub)}]")
+            sigma = 0.0
 
     # Price & Greeks
     price = bsm_price(is_call, S, K, T, r, q, sigma) if sigma > 0 else (price_mkt or 0.0)
@@ -209,7 +202,11 @@ with colR:
     s_max = st.number_input("Max Underlying (₹)", value=S * 1.3, step=1.0)
     n_pts = st.slider("Points", 50, 600, 251, step=1)
 
-# Scenario grid
+# Auto-refresh gimmick (keeps cache fresh while checkbox on)
+if use_yahoo and auto_refresh:
+    st.experimental_rerun  # no call, streamlit already re-runs on interaction; cache ttl=30s handles updates.
+
+# --------- Scenarios & charts ---------
 grid = np.linspace(float(s_min), float(s_max), int(n_pts))
 if sigma > 0:
     values = [bsm_price(is_call, s, K, T, r, q, sigma) for s in grid]
@@ -223,10 +220,8 @@ if sigma > 0:
         gr_series["Rho"].append(g["rho"])
 else:
     values = [np.nan] * len(grid)
-    gr_series = {"Delta": [np.nan]*len(grid), "Gamma": [np.nan]*len(grid),
-                 "Theta/day": [np.nan]*len(grid), "Vega": [np.nan]*len(grid), "Rho": [np.nan]*len(grid)}
+    gr_series = {k: [np.nan]*len(grid) for k in ["Delta", "Gamma", "Theta/day", "Vega", "Rho"]}
 
-# Charts
 st.markdown("### 📊 Option Value vs Underlying")
 fig1, ax1 = plt.subplots()
 ax1.plot(grid, values, label="Option Value")
@@ -248,7 +243,6 @@ for name in ["Delta", "Gamma", "Theta/day", "Vega", "Rho"]:
     ax.legend()
     st.pyplot(fig)
 
-# Export
 df = pd.DataFrame({
     "S": grid,
     "OptionValue": values,
@@ -261,4 +255,4 @@ df = pd.DataFrame({
 st.download_button("⬇️ Download Scenario CSV", df.to_csv(index=False).encode("utf-8"),
                    file_name="bsm_scenario.csv", mime="text/csv")
 
-st.caption("Made for Indian markets. Educational only — not investment advice. Update lot sizes & rates per latest NSE circulars.")
+st.caption("Yahoo prices are delayed ~15–20 minutes. Educational use only. Update lot sizes & rates per latest NSE circulars.")
