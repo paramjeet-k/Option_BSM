@@ -1,0 +1,6 @@
+streamlit>=1.36.0
+numpy>=1.26.4
+pandas>=2.2.2
+scipy>=1.13.1
+matplotlib>=3.9.0
+pytz>=2024.1
